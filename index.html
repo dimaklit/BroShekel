@@ -1,0 +1,1135 @@
+import React, { useState, useEffect, useRef } from 'react';
+import * as Y from 'https://esm.sh/yjs@13.6.1';
+import { WebsocketProvider } from 'https://esm.sh/y-websocket@1.5.0';
+
+export default function App() {
+  // --- Состояние приложения ---
+  const [friends, setFriends] = useState([]);
+  const [expenses, setExpenses] = useState([]);
+
+  // Состояние совместного доступа
+  const [isCollaborative, setIsCollaborative] = useState(false);
+  const [roomCode, setRoomCode] = useState('');
+  const [syncStatus, setSyncStatus] = useState('offline'); // 'offline' | 'connecting' | 'connected'
+  const [activeUsers, setActiveUsers] = useState(1);
+
+  // Ссылки на объекты совместной работы Yjs
+  const yDocRef = useRef(null);
+  const yMapRef = useRef(null);
+  const providerRef = useRef(null);
+
+  // Состояние форм добавления
+  const [newFriendName, setNewFriendName] = useState('');
+  const [newFriendCount, setNewFriendCount] = useState(1);
+  const [expenseTitle, setExpenseTitle] = useState('');
+  const [expenseAmount, setExpenseAmount] = useState('');
+  const [expensePayerId, setExpensePayerId] = useState('');
+  const [selectedParticipantIds, setSelectedParticipantIds] = useState([]);
+  
+  // Состояние редактирования участника
+  const [editingFriendId, setEditingFriendId] = useState(null);
+  const [editingName, setEditingName] = useState('');
+  const [editingCount, setEditingCount] = useState(1);
+
+  // Кастомные окна подтверждения (взамен window.confirm)
+  const [deleteConfirm, setDeleteConfirm] = useState({ isOpen: false, targetId: null, targetName: '', type: 'friend' }); // type: 'friend' | 'reset'
+
+  // Уведомления и вкладки интерфейса
+  const [activeTab, setActiveTab] = useState('expenses'); // 'expenses' | 'settlements' | 'friends'
+  const [notification, setNotification] = useState(null);
+
+  // Инициализация синхронизации в реальном времени при наличии хэша комнаты
+  useEffect(() => {
+    const handleHashChange = () => {
+      const hash = window.location.hash;
+      const match = hash.match(/room=([^&]+)/);
+      
+      if (match) {
+        const roomId = match[1];
+        setRoomCode(roomId);
+        setIsCollaborative(true);
+        setSyncStatus('connecting');
+
+        // Очищаем старое подключение, если оно было
+        if (providerRef.current) providerRef.current.destroy();
+        if (yDocRef.current) yDocRef.current.destroy();
+
+        // Создаем новый Yjs документ
+        const doc = new Y.Doc();
+        yDocRef.current = doc;
+
+        // Подключаемся к публичному демо-серверу веб-сокетов Yjs
+        const provider = new WebsocketProvider(
+          'wss://demos.yjs.dev', 
+          `split-shekels-room-${roomId}`, 
+          doc
+        );
+        providerRef.current = provider;
+
+        const sharedMap = doc.getMap('state');
+        yMapRef.current = sharedMap;
+
+        // Отслеживаем статус подключения
+        provider.on('status', event => {
+          setSyncStatus(event.status === 'connected' ? 'connected' : 'connecting');
+        });
+
+        // Отслеживаем количество активных пользователей в комнате
+        provider.awareness.on('change', () => {
+          setActiveUsers(provider.awareness.getStates().size);
+        });
+
+        // Слушаем изменения общего состояния от других пользователей
+        sharedMap.observe(() => {
+          const remoteFriends = sharedMap.get('friends');
+          const remoteExpenses = sharedMap.get('expenses');
+          
+          if (remoteFriends) setFriends(remoteFriends);
+          if (remoteExpenses) setExpenses(remoteExpenses);
+        });
+
+      } else {
+        // Обычный локальный режим (Offline)
+        setIsCollaborative(false);
+        setRoomCode('');
+        setSyncStatus('offline');
+        
+        const savedFriends = localStorage.getItem('split_friends_v3');
+        const savedExpenses = localStorage.getItem('split_expenses_v3');
+        
+        setFriends(savedFriends ? JSON.parse(savedFriends) : [
+          { id: '1', name: 'Алексей', count: 1 },
+          { id: '2', name: 'Мария', count: 2 },
+          { id: '3', name: 'Дмитрий', count: 1 },
+          { id: '4', name: 'Анна', count: 1 }
+        ]);
+
+        setExpenses(savedExpenses ? JSON.parse(savedExpenses) : [
+          { id: 'e1', title: 'Продукты и угли', amount: 350, payerId: '1', participantIds: ['1', '2', '3', '4'] },
+          { id: 'e2', title: 'Аренда беседки', amount: 500, payerId: '2', participantIds: ['1', '2', '3', '4'] },
+          { id: 'e3', title: 'Такси', amount: 120, payerId: '3', participantIds: ['3', '4'] }
+        ]);
+      }
+    };
+
+    handleHashChange();
+    window.addEventListener('hashchange', handleHashChange);
+    return () => {
+      window.removeEventListener('hashchange', handleHashChange);
+      if (providerRef.current) providerRef.current.destroy();
+      if (yDocRef.current) yDocRef.current.destroy();
+    };
+  }, []);
+
+  // Универсальная функция обновления состояния (локально или в облако Yjs)
+  const updateData = (newFriends, newExpenses) => {
+    if (isCollaborative && yMapRef.current) {
+      yDocRef.current.transact(() => {
+        if (newFriends !== null) yMapRef.current.set('friends', newFriends);
+        if (newExpenses !== null) yMapRef.current.set('expenses', newExpenses);
+      });
+    } else {
+      if (newFriends !== null) {
+        setFriends(newFriends);
+        localStorage.setItem('split_friends_v3', JSON.stringify(newFriends));
+      }
+      if (newExpenses !== null) {
+        setExpenses(newExpenses);
+        localStorage.setItem('split_expenses_v3', JSON.stringify(newExpenses));
+      }
+    }
+  };
+
+  // Функция запуска совместного доступа
+  const createSharedRoom = () => {
+    const randomId = Math.random().toString(36).substring(2, 9);
+    window.location.hash = `room=${randomId}`;
+    
+    // Копируем ссылку в буфер
+    const shareUrl = `${window.location.origin}${window.location.pathname}#room=${randomId}`;
+    navigator.clipboard.writeText(shareUrl).then(() => {
+      showToast('Комната создана! Ссылка скопирована для ваших друзей 🚀', 'success');
+    }).catch(() => {
+      showToast(`Комната создана! Код: ${randomId}`, 'success');
+    });
+  };
+
+  // Выйти из совместной комнаты в локальный режим
+  const leaveRoom = () => {
+    window.location.hash = '';
+    showToast('Вы вышли из совместной комнаты', 'info');
+  };
+
+  // Синхронизация по умолчанию для выбранных участников
+  useEffect(() => {
+    setSelectedParticipantIds(friends.map(f => f.id));
+    if (friends.length > 0) {
+      const exists = friends.some(f => f.id === expensePayerId);
+      if (!exists) {
+        setExpensePayerId(friends[0].id);
+      }
+    }
+  }, [friends]);
+
+  // Показ красивых уведомлений
+  const showToast = (message, type = 'info') => {
+    setNotification({ message, type });
+    setTimeout(() => {
+      setNotification(null);
+    }, 4500);
+  };
+
+  // --- Бизнес-логика: Участники ---
+  const handleAddFriend = (e) => {
+    e.preventDefault();
+    const name = newFriendName.trim();
+    if (!name) return;
+    if (friends.some(f => f.name.toLowerCase() === name.toLowerCase())) {
+      showToast('Участник с таким именем уже добавлен!', 'warning');
+      return;
+    }
+    
+    const newFriend = {
+      id: Date.now().toString(),
+      name,
+      count: Math.max(1, newFriendCount)
+    };
+
+    updateData([...friends, newFriend], null);
+    setNewFriendName('');
+    setNewFriendCount(1);
+    showToast(`Участник "${name}" добавлен!`, 'success');
+  };
+
+  const requestRemoveFriend = (id, name) => {
+    setDeleteConfirm({
+      isOpen: true,
+      targetId: id,
+      targetName: name,
+      type: 'friend'
+    });
+  };
+
+  const confirmRemoveFriend = () => {
+    const id = deleteConfirm.targetId;
+    const name = deleteConfirm.targetName;
+
+    const filteredFriends = friends.filter(f => f.id !== id);
+    const updatedExpenses = expenses.filter(exp => exp.payerId !== id).map(exp => ({
+      ...exp,
+      participantIds: exp.participantIds.filter(pId => pId !== id)
+    })).filter(exp => exp.participantIds.length > 0);
+
+    updateData(filteredFriends, updatedExpenses);
+    setDeleteConfirm({ isOpen: false, targetId: null, targetName: '', type: 'friend' });
+    showToast(`Участник "${name}" удален`, 'info');
+  };
+
+  const startEditing = (friend) => {
+    setEditingFriendId(friend.id);
+    setEditingName(friend.name);
+    setEditingCount(friend.count);
+  };
+
+  const saveEditedFriend = () => {
+    const trimmedName = editingName.trim();
+    if (!trimmedName) {
+      showToast('Имя не может быть пустым!', 'error');
+      return;
+    }
+    if (friends.some(f => f.id !== editingFriendId && f.name.toLowerCase() === trimmedName.toLowerCase())) {
+      showToast('Это имя уже занято другим участником!', 'warning');
+      return;
+    }
+
+    const updatedFriends = friends.map(f => 
+      f.id === editingFriendId 
+        ? { ...f, name: trimmedName, count: Math.max(1, editingCount) } 
+        : f
+    );
+    
+    updateData(updatedFriends, null);
+    setEditingFriendId(null);
+    showToast('Данные участника сохранены', 'success');
+  };
+
+  // --- Бизнес-логика: Расходы ---
+  const handleAddExpense = (e) => {
+    e.preventDefault();
+    const amount = parseFloat(expenseAmount);
+    const title = expenseTitle.trim() || 'Общая покупка';
+    const payerId = expensePayerId || (friends.length > 0 ? friends[0].id : '');
+
+    if (!payerId) {
+      showToast('Сначала добавьте хотя бы одного участника!', 'error');
+      return;
+    }
+    if (isNaN(amount) || amount <= 0) {
+      showToast('Введите корректную сумму расхода!', 'error');
+      return;
+    }
+    if (selectedParticipantIds.length === 0) {
+      showToast('Выберите хотя бы одного участника для деления расходов!', 'warning');
+      return;
+    }
+
+    const newExpense = {
+      id: Date.now().toString(),
+      title,
+      amount,
+      payerId,
+      participantIds: [...selectedParticipantIds]
+    };
+
+    updateData(null, [newExpense, ...expenses]);
+    setExpenseTitle('');
+    setExpenseAmount('');
+    showToast('Расход успешно добавлен!', 'success');
+  };
+
+  const handleDeleteExpense = (id) => {
+    updateData(null, expenses.filter(exp => exp.id !== id));
+    showToast('Расход удален', 'info');
+  };
+
+  const toggleParticipant = (id) => {
+    if (selectedParticipantIds.includes(id)) {
+      setSelectedParticipantIds(selectedParticipantIds.filter(pId => pId !== id));
+    } else {
+      setSelectedParticipantIds([...selectedParticipantIds, id]);
+    }
+  };
+
+  const selectAllParticipants = () => setSelectedParticipantIds(friends.map(f => f.id));
+  const selectNoParticipants = () => setSelectedParticipantIds([]);
+
+  // --- Алгоритм расчета балансов с учетом весов ---
+  const calculateData = () => {
+    const totalSpent = expenses.reduce((sum, exp) => sum + exp.amount, 0);
+    
+    const balances = {};
+    friends.forEach(f => {
+      balances[f.id] = 0;
+    });
+
+    expenses.forEach(exp => {
+      const payerId = exp.payerId;
+      const amount = exp.amount;
+      const participantIds = exp.participantIds;
+
+      const activeParticipants = friends.filter(f => participantIds.includes(f.id));
+      const totalWeight = activeParticipants.reduce((sum, f) => sum + f.count, 0);
+
+      if (totalWeight > 0) {
+        if (balances[payerId] !== undefined) {
+          balances[payerId] += amount;
+        }
+        
+        const costPerUnitWeight = amount / totalWeight;
+        activeParticipants.forEach(p => {
+          if (balances[p.id] !== undefined) {
+            balances[p.id] -= p.count * costPerUnitWeight;
+          }
+        });
+      }
+    });
+
+    const debtors = [];
+    const creditors = [];
+
+    Object.keys(balances).forEach(id => {
+      const balance = balances[id];
+      const friend = friends.find(f => f.id === id);
+      const name = friend ? friend.name : 'Удаленный участник';
+      
+      if (balance < -0.01) {
+        debtors.push({ id, name, balance: Math.abs(balance) });
+      } else if (balance > 0.01) {
+        creditors.push({ id, name, balance: balance });
+      }
+    });
+
+    debtors.sort((a, b) => b.balance - a.balance);
+    creditors.sort((a, b) => b.balance - a.balance);
+
+    const transfers = [];
+    let dIdx = 0;
+    let cIdx = 0;
+
+    while (dIdx < debtors.length && cIdx < creditors.length) {
+      const debtor = debtors[dIdx];
+      const creditor = creditors[cIdx];
+
+      const amountToTransfer = Math.min(debtor.balance, creditor.balance);
+
+      if (amountToTransfer > 0.01) {
+        transfers.push({
+          from: debtor.name,
+          to: creditor.name,
+          amount: amountToTransfer
+        });
+      }
+
+      debtor.balance -= amountToTransfer;
+      creditor.balance -= amountToTransfer;
+
+      if (debtor.balance < 0.01) dIdx++;
+      if (creditor.balance < 0.01) cIdx++;
+    }
+
+    return {
+      totalSpent,
+      balances,
+      transfers
+    };
+  };
+
+  const { totalSpent, balances, transfers } = calculateData();
+
+  // Копирование текстового отчета
+  const copyReportToClipboard = () => {
+    let text = `📊 *ОТЧЕТ ПО РАСХОДАМ (ШЕКЕЛИ)*\n`;
+    text += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+    if (isCollaborative) {
+      text += `🔗 Комната совместной работы: ${window.location.href}\n`;
+    }
+    text += `💰 Всего потрачено: ${totalSpent.toFixed(2)} ₪\n`;
+    text += `👥 Всего участников: ${friends.length}\n`;
+    const totalPeople = friends.reduce((s, f) => s + f.count, 0);
+    text += `👪 Суммарно человек: ${totalPeople}\n\n`;
+    
+    text += `💵 *Итоговый баланс каждого (потратил - доля):*\n`;
+    Object.entries(balances).forEach(([id, bal]) => {
+      const friend = friends.find(f => f.id === id);
+      if (friend) {
+        const sign = bal > 0 ? '+' : '';
+        text += `• ${friend.name} (${friend.count} чел.): ${sign}${bal.toFixed(2)} ₪\n`;
+      }
+    });
+    
+    text += `\n🔄 *Оптимальные переводы:*\n`;
+    if (transfers.length === 0) {
+      text += `Все в расчете! Никто никому не должен. 🎉\n`;
+    } else {
+      transfers.forEach(t => {
+        text += `• ${t.from} ➔ ${t.to}: ${t.amount.toFixed(2)} ₪\n`;
+      });
+    }
+
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      showToast('Отчет в шекелях скопирован в буфер!', 'success');
+    } catch (err) {
+      showToast('Не удалось скопировать отчет', 'error');
+    }
+    document.body.removeChild(textArea);
+  };
+
+  const requestResetAll = () => {
+    setDeleteConfirm({
+      isOpen: true,
+      targetId: null,
+      targetName: 'Все данные',
+      type: 'reset'
+    });
+  };
+
+  const confirmResetAll = () => {
+    updateData([], []);
+    setDeleteConfirm({ isOpen: false, targetId: null, targetName: '', type: 'reset' });
+    showToast('Данные полностью очищены', 'info');
+  };
+
+  const getAvatarColor = (name) => {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) {
+      hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    const colors = [
+      'bg-indigo-500 text-white',
+      'bg-emerald-500 text-white',
+      'bg-sky-500 text-white',
+      'bg-rose-500 text-white',
+      'bg-amber-500 text-white',
+      'bg-purple-500 text-white',
+      'bg-teal-500 text-white'
+    ];
+    return colors[Math.abs(hash) % colors.length];
+  };
+
+  const copyRoomLink = () => {
+    navigator.clipboard.writeText(window.location.href).then(() => {
+      showToast('Ссылка на совместную комнату скопирована!', 'success');
+    });
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col antialiased">
+      {/* Кастомное модальное окно подтверждения удаления */}
+      {deleteConfirm.isOpen && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-fade-in">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-100">
+            <div className="text-center">
+              <span className="text-4xl block mb-2">🚨</span>
+              <h3 className="text-lg font-black text-slate-900 mb-2">Подтвердите действие</h3>
+              <p className="text-sm text-slate-500 mb-6">
+                {deleteConfirm.type === 'friend' 
+                  ? `Вы уверены, что хотите удалить "${deleteConfirm.targetName}"? Это сотрет его из всех связанных чеков и расчетов.`
+                  : `Вы действительно хотите полностью стереть все расходы и список друзей? Это действие необратимо.`
+                }
+              </p>
+            </div>
+            <div className="flex space-x-3">
+              <button
+                onClick={() => setDeleteConfirm({ isOpen: false, targetId: null, targetName: '', type: 'friend' })}
+                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-xl transition-all"
+              >
+                Отмена
+              </button>
+              <button
+                onClick={deleteConfirm.type === 'friend' ? confirmRemoveFriend : confirmResetAll}
+                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 text-white text-sm font-bold rounded-xl shadow-lg shadow-rose-200 transition-all"
+              >
+                Да, удалить
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Тосты-уведомления */}
+      {notification && (
+        <div className="fixed top-4 right-4 z-50 animate-bounce">
+          <div className={`px-4 py-3 rounded-xl shadow-xl flex items-center space-x-2 text-sm font-semibold border ${
+            notification.type === 'success' ? 'bg-emerald-50 border-emerald-200 text-emerald-800' :
+            notification.type === 'warning' ? 'bg-amber-50 border-amber-200 text-amber-800' :
+            notification.type === 'error' ? 'bg-rose-50 border-rose-200 text-rose-800' :
+            'bg-indigo-50 border-indigo-200 text-indigo-800'
+          }`}>
+            <span>
+              {notification.type === 'success' && '✅'}
+              {notification.type === 'warning' && '⚠️'}
+              {notification.type === 'error' && '❌'}
+              {notification.type === 'info' && 'ℹ️'}
+            </span>
+            <span>{notification.message}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Шапка */}
+      <header className="bg-white border-b border-slate-100 shadow-sm sticky top-0 z-10">
+        <div className="max-w-5xl mx-auto px-4 py-4 flex flex-col md:flex-row justify-between items-center gap-4">
+          <div className="flex items-center space-x-3 w-full md:w-auto">
+            <div className="w-10 h-10 bg-indigo-600 rounded-2xl flex items-center justify-center text-white text-xl shadow-lg shadow-indigo-200">
+              🇮🇱
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-slate-900 tracking-tight flex items-center gap-1.5">
+                Расчеты в шекелях ₪
+              </h1>
+              <p className="text-xs text-slate-500">Мультиплеер-версия для поездок и встреч</p>
+            </div>
+          </div>
+          
+          {/* Статус-панель синхронизации */}
+          <div className="flex flex-wrap items-center gap-2 w-full md:w-auto justify-end">
+            {isCollaborative ? (
+              <div className="flex items-center space-x-2 bg-emerald-50 border border-emerald-200 px-3 py-1.5 rounded-xl text-xs font-semibold text-emerald-800">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                <span>Комната: #{roomCode}</span>
+                <span className="text-emerald-400">|</span>
+                <span>👥 {activeUsers} в сети</span>
+                <button 
+                  onClick={copyRoomLink}
+                  className="ml-2 bg-emerald-600 hover:bg-emerald-700 text-white px-2 py-1 rounded-lg text-[10px]"
+                >
+                  🔗 Ссылка
+                </button>
+                <button 
+                  onClick={leaveRoom}
+                  className="bg-slate-200 hover:bg-slate-300 text-slate-700 px-2 py-1 rounded-lg text-[10px]"
+                  title="Выйти из комнаты"
+                >
+                  Выйти
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={createSharedRoom}
+                className="w-full md:w-auto bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-700 hover:to-indigo-800 text-white text-xs font-bold px-4 py-2 rounded-xl shadow-md transition-all flex items-center justify-center space-x-1"
+              >
+                <span>🌐</span>
+                <span>Создать общую комнату</span>
+              </button>
+            )}
+          </div>
+        </div>
+      </header>
+
+      {/* Контент */}
+      <main className="flex-1 max-w-5xl w-full mx-auto px-4 py-6">
+        {/* Инфо-панель бюджетов */}
+        <div className="grid grid-cols-3 gap-2 bg-slate-100 p-2 rounded-2xl mb-6 text-center border border-slate-200/50">
+          <div className="p-2">
+            <span className="block text-[10px] text-slate-400 font-bold uppercase">Общий бюджет</span>
+            <span className="text-base font-black text-slate-950">{totalSpent.toFixed(1)} ₪</span>
+          </div>
+          <div className="p-2 border-x border-slate-200">
+            <span className="block text-[10px] text-slate-400 font-bold uppercase">Суммарно людей</span>
+            <span className="text-base font-black text-slate-950">
+              {friends.reduce((sum, f) => sum + f.count, 0)} чел.
+            </span>
+          </div>
+          <div className="p-2">
+            <span className="block text-[10px] text-slate-400 font-bold uppercase">Минимум транзакций</span>
+            <span className="text-base font-black text-slate-950">{transfers.length}</span>
+          </div>
+        </div>
+
+        {/* Вкладки */}
+        <div className="flex space-x-1 bg-slate-200/60 p-1 rounded-2xl mb-6">
+          <button
+            onClick={() => setActiveTab('expenses')}
+            className={`flex-1 py-3 text-sm font-semibold rounded-xl transition-all duration-200 flex items-center justify-center space-x-2 ${
+              activeTab === 'expenses' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <span>📝</span>
+            <span className="hidden sm:inline">Чеки & Расходы</span>
+            <span className="inline sm:hidden">Расходы</span>
+            {expenses.length > 0 && (
+              <span className="ml-1 px-1.5 py-0.5 text-[10px] bg-indigo-100 text-indigo-700 rounded-full font-bold">
+                {expenses.length}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={() => setActiveTab('settlements')}
+            className={`flex-1 py-3 text-sm font-semibold rounded-xl transition-all duration-200 flex items-center justify-center space-x-2 ${
+              activeTab === 'settlements' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <span>🔄</span>
+            <span className="hidden sm:inline">Итоги & Переводы</span>
+            <span className="inline sm:hidden">Переводы</span>
+            {transfers.length > 0 && (
+              <span className="ml-1 px-1.5 py-0.5 text-[10px] bg-emerald-100 text-emerald-700 rounded-full font-bold">
+                {transfers.length}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={() => setActiveTab('friends')}
+            className={`flex-1 py-3 text-sm font-semibold rounded-xl transition-all duration-200 flex items-center justify-center space-x-2 ${
+              activeTab === 'friends' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <span>👥</span>
+            <span className="hidden sm:inline">Друзья & Состав</span>
+            <span className="inline sm:hidden">Друзья</span>
+            {friends.length > 0 && (
+              <span className="ml-1 px-1.5 py-0.5 text-[10px] bg-slate-300 text-slate-800 rounded-full font-bold">
+                {friends.length}
+              </span>
+            )}
+          </button>
+        </div>
+
+        {/* --- ВКЛАДКА 1: РАСХОДЫ --- */}
+        {activeTab === 'expenses' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            {/* Форма добавления расхода */}
+            <div className="lg:col-span-5 bg-white p-6 rounded-2xl border border-slate-100 shadow-sm">
+              <h2 className="text-lg font-bold text-slate-900 mb-4 flex items-center">
+                <span className="mr-2">➕</span> Записать расход
+              </h2>
+              
+              {friends.length < 2 ? (
+                <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl text-amber-900 text-sm">
+                  ⚠️ <strong>Недостаточно участников.</strong> Для распределения чека добавьте хотя бы 2 человек во вкладке <strong>«Участники»</strong>.
+                </div>
+              ) : (
+                <form onSubmit={handleAddExpense} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Что купили?</label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="Ресторан, продукты, жилье..."
+                      value={expenseTitle}
+                      onChange={(e) => setExpenseTitle(e.target.value)}
+                      className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 outline-none transition-all text-sm"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Сумма в шекелях (₪)</label>
+                    <input
+                      type="number"
+                      required
+                      min="0.01"
+                      step="any"
+                      placeholder="0.00 ₪"
+                      value={expenseAmount}
+                      onChange={(e) => setExpenseAmount(e.target.value)}
+                      className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 outline-none transition-all text-sm font-semibold"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Кто заплатил?</label>
+                    <div className="relative">
+                      <select
+                        value={expensePayerId}
+                        onChange={(e) => setExpensePayerId(e.target.value)}
+                        className="w-full px-4 py-2.5 border border-slate-200 rounded-xl bg-slate-50 text-slate-800 focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 outline-none transition-all text-sm appearance-none font-medium"
+                      >
+                        {friends.map(f => (
+                          <option key={f.id} value={f.id}>{f.name} ({f.count} чел.)</option>
+                        ))}
+                      </select>
+                      <div className="absolute inset-y-0 right-3 flex items-center pointer-events-none text-slate-400">
+                        ▼
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between items-center mb-1.5">
+                      <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider">Кто участвует в покупке?</label>
+                      <div className="space-x-2 text-[10px] font-bold uppercase tracking-wider">
+                        <button type="button" onClick={selectAllParticipants} className="text-indigo-600 hover:text-indigo-800">Все</button>
+                        <span className="text-slate-300">|</span>
+                        <button type="button" onClick={selectNoParticipants} className="text-rose-600 hover:text-rose-800">Сбросить</button>
+                      </div>
+                    </div>
+                    
+                    <div className="border border-slate-100 rounded-xl p-3 bg-slate-50/50 max-h-48 overflow-y-auto space-y-1.5">
+                      {friends.map(f => {
+                        const isChecked = selectedParticipantIds.includes(f.id);
+                        return (
+                          <label
+                            key={f.id}
+                            className={`flex items-center justify-between p-2 rounded-lg cursor-pointer transition-all ${
+                              isChecked ? 'bg-indigo-50/70 border border-indigo-100' : 'bg-transparent border border-transparent hover:bg-slate-100'
+                            }`}
+                          >
+                            <div className="flex items-center space-x-2">
+                              <span className="text-sm font-medium text-slate-800">{f.name}</span>
+                              <span className="text-xs text-slate-400 bg-slate-200/50 px-1.5 py-0.5 rounded-full font-bold">
+                                {f.count} чел.
+                              </span>
+                            </div>
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => toggleParticipant(f.id)}
+                              className="w-4 h-4 text-indigo-600 rounded border-slate-300 focus:ring-indigo-500"
+                            />
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-xl shadow-lg shadow-indigo-200 transition-all flex items-center justify-center space-x-2"
+                  >
+                    <span>₪</span>
+                    <span>Добавить расход</span>
+                  </button>
+                </form>
+              )}
+            </div>
+
+            {/* Список расходов */}
+            <div className="lg:col-span-7 space-y-4">
+              <div className="bg-white p-6 rounded-2xl border border-slate-100 shadow-sm">
+                <div className="flex justify-between items-center mb-4">
+                  <h2 className="text-lg font-bold text-slate-900 flex items-center">
+                    <span className="mr-2">🕒</span> Список чеков
+                  </h2>
+                  <span className="text-xs text-slate-400 font-medium">Валюта: Шекели (₪)</span>
+                </div>
+
+                {expenses.length === 0 ? (
+                  <div className="text-center py-12">
+                    <div className="text-4xl mb-3">🛒</div>
+                    <p className="text-slate-500 text-sm">История трат пока пуста.</p>
+                    <p className="text-slate-400 text-xs mt-1">Добавьте первый расход с помощью формы слева.</p>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-slate-100">
+                    {expenses.map((exp) => {
+                      const payer = friends.find(f => f.id === exp.payerId);
+                      const payerName = payer ? payer.name : 'Удаленный друг';
+                      
+                      const activeParts = friends.filter(f => exp.participantIds.includes(f.id));
+                      const totalWeight = activeParts.reduce((s, f) => s + f.count, 0);
+
+                      return (
+                        <div key={exp.id} className="py-4 first:pt-0 last:pb-0 flex items-center justify-between gap-4">
+                          <div className="flex items-start space-x-3 min-w-0">
+                            <div className={`w-9 h-9 rounded-full flex items-center justify-center font-bold shrink-0 ${getAvatarColor(payerName)}`}>
+                              {payerName.charAt(0)}
+                            </div>
+                            <div className="min-w-0">
+                              <h4 className="text-sm font-bold text-slate-900 truncate">{exp.title}</h4>
+                              <p className="text-xs text-slate-500">
+                                Заплатил(а) <span className="font-semibold text-slate-700">{payerName}</span>
+                              </p>
+                              <div className="mt-1 flex flex-wrap items-center gap-1">
+                                <span className="text-[10px] text-slate-400 font-semibold mr-1">Для кого:</span>
+                                {activeParts.map(p => (
+                                  <span key={p.id} className="text-[9px] bg-slate-100 border border-slate-200 text-slate-600 px-1.5 py-0.5 rounded font-medium">
+                                    {p.name} ({p.count} чел.)
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center space-x-3 shrink-0">
+                            <div className="text-right">
+                              <span className="block text-sm font-black text-slate-950">{exp.amount.toFixed(1)} ₪</span>
+                              <span className="text-[10px] text-slate-400 block">
+                                всего весов: {totalWeight}
+                              </span>
+                            </div>
+                            <button
+                              onClick={() => handleDeleteExpense(exp.id)}
+                              className="p-1.5 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-all"
+                              title="Удалить"
+                            >
+                              🗑️
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* --- ВКЛАДКА 2: ИТОГИ И ПЕРЕВОДЫ --- */}
+        {activeTab === 'settlements' && (
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+            {/* Балансы */}
+            <div className="md:col-span-5 bg-white p-6 rounded-2xl border border-slate-100 shadow-sm">
+              <h2 className="text-lg font-bold text-slate-900 mb-4 flex items-center">
+                <span className="mr-2">⚖️</span> Баланс участников
+              </h2>
+              <p className="text-xs text-slate-400 mb-4">
+                С учетом веса (количества людей). Положительный баланс означает, что человеку должны вернуть шекели, отрицательный — что он должен сдать в кассу.
+              </p>
+
+              {friends.length === 0 ? (
+                <p className="text-sm text-slate-500 text-center py-6">Добавьте участников для расчета.</p>
+              ) : (
+                <div className="space-y-3">
+                  {Object.entries(balances).map(([id, bal]) => {
+                    const friend = friends.find(f => f.id === id);
+                    if (!friend) return null;
+
+                    const isCreditor = bal > 0.01;
+                    const isDebtor = bal < -0.01;
+                    return (
+                      <div key={id} className="flex items-center justify-between p-3 rounded-xl bg-slate-50 border border-slate-100">
+                        <div className="flex items-center space-x-3">
+                          <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold ${getAvatarColor(friend.name)}`}>
+                            {friend.name.charAt(0)}
+                          </div>
+                          <div>
+                            <span className="text-sm font-bold text-slate-800 block">{friend.name}</span>
+                            <span className="text-[10px] text-slate-400 font-medium">Коэффициент: {friend.count} чел.</span>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          {isCreditor && (
+                            <span className="text-sm font-bold text-emerald-600">+{bal.toFixed(1)} ₪</span>
+                          )}
+                          {isDebtor && (
+                            <span className="text-sm font-bold text-rose-500">{bal.toFixed(1)} ₪</span>
+                          )}
+                          {!isCreditor && !isDebtor && (
+                            <span className="text-sm font-bold text-slate-400">в расчете</span>
+                          )}
+                          <span className="block text-[10px] text-slate-400">
+                            {isCreditor ? 'вернут ему' : isDebtor ? 'его долг' : 'чист'}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Оптимальные переводы */}
+            <div className="md:col-span-7 bg-white p-6 rounded-2xl border border-slate-100 shadow-sm">
+              <div className="flex justify-between items-center mb-4 flex-wrap gap-2">
+                <h2 className="text-lg font-bold text-slate-900 flex items-center">
+                  <span className="mr-2">🤝</span> Оптимизированные долги
+                </h2>
+                {transfers.length > 0 && (
+                  <button
+                    onClick={copyReportToClipboard}
+                    className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold px-3 py-1.5 rounded-lg border border-indigo-100 transition-all flex items-center space-x-1"
+                  >
+                    <span>📋</span>
+                    <span>Копировать отчет в ₪</span>
+                  </button>
+                )}
+              </div>
+
+              {expenses.length === 0 ? (
+                <div className="text-center py-12">
+                  <div className="text-4xl mb-3">🤝</div>
+                  <p className="text-slate-500 text-sm">Добавьте расходы, чтобы рассчитать взаимозачеты.</p>
+                </div>
+              ) : transfers.length === 0 ? (
+                <div className="bg-emerald-50 border border-emerald-100 text-emerald-900 p-6 rounded-2xl text-center">
+                  <div className="text-3xl mb-2">🎉</div>
+                  <h4 className="font-bold text-emerald-800 text-base">Все в расчете!</h4>
+                  <p className="text-xs text-emerald-600 mt-1">
+                    Каждый сдал ровно столько шекелей, сколько требовалось с учетом его компании.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    {transfers.map((t, idx) => (
+                      <div key={idx} className="flex items-center justify-between p-4 bg-indigo-50/40 rounded-xl border border-indigo-100">
+                        <div className="flex items-center space-x-2 text-sm">
+                          <span className="font-bold text-slate-800">{t.from}</span>
+                          <span className="text-indigo-400 font-bold">переводит</span>
+                          <span className="font-bold text-slate-800">{t.to}</span>
+                        </div>
+                        <div className="text-right">
+                          <span className="text-base font-black text-indigo-700">{t.amount.toFixed(1)} ₪</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-100 text-xs text-slate-400 flex items-start gap-2">
+                    <span className="text-base leading-none">💡</span>
+                    <span>
+                      Этот список сводит транзакции к минимуму. Каждая пара производит один прямой перевод в шекелях (₪).
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* --- ВКЛАДКА 3: УЧАСТНИКИ --- */}
+        {activeTab === 'friends' && (
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+            {/* Добавить */}
+            <div className="md:col-span-5 bg-white p-6 rounded-2xl border border-slate-100 shadow-sm">
+              <h2 className="text-lg font-bold text-slate-900 mb-4 flex items-center">
+                <span className="mr-2">👤</span> Добавить участника
+              </h2>
+              <form onSubmit={handleAddFriend} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Имя друга</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Александр, Катя..."
+                    value={newFriendName}
+                    onChange={(e) => setNewFriendName(e.target.value)}
+                    className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 outline-none transition-all text-sm"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
+                    Количество человек под этим именем
+                  </label>
+                  <div className="flex items-center space-x-3">
+                    <button
+                      type="button"
+                      onClick={() => setNewFriendCount(prev => Math.max(1, prev - 1))}
+                      className="w-10 h-10 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded-xl transition-all"
+                    >
+                      -
+                    </button>
+                    <span className="text-base font-black text-slate-900 w-12 text-center">{newFriendCount}</span>
+                    <button
+                      type="button"
+                      onClick={() => setNewFriendCount(prev => prev + 1)}
+                      className="w-10 h-10 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded-xl transition-all"
+                    >
+                      +
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    Укажите, за скольких человек платит этот участник (например, 2 если пара, или 3-4 если семья).
+                  </p>
+                </div>
+
+                <button
+                  type="submit"
+                  className="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-2.5 px-4 rounded-xl transition-all flex items-center justify-center space-x-1.5"
+                >
+                  <span>Добавить</span>
+                </button>
+              </form>
+
+              {friends.length > 0 && (
+                <div className="mt-8 pt-6 border-t border-slate-100">
+                  <h3 className="text-xs font-bold text-rose-500 uppercase tracking-wider mb-2">Опасная зона</h3>
+                  <button
+                    onClick={requestResetAll}
+                    className="w-full bg-rose-50 border border-rose-200 hover:bg-rose-100 text-rose-700 text-xs font-bold py-2 rounded-xl transition-all"
+                  >
+                    🗑️ Начать с чистого листа
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Список всех с возможностью редактирования */}
+            <div className="md:col-span-7 bg-white p-6 rounded-2xl border border-slate-100 shadow-sm">
+              <h2 className="text-lg font-bold text-slate-900 mb-4 flex items-center">
+                <span className="mr-2">👥</span> Участники компании ({friends.length})
+              </h2>
+
+              {friends.length === 0 ? (
+                <div className="text-center py-12">
+                  <div className="text-4xl mb-3">👥</div>
+                  <p className="text-slate-500 text-sm">Ваша компания пуста.</p>
+                  <p className="text-slate-400 text-xs mt-1">Добавьте друзей с коэффициентами участников.</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {friends.map((friend) => {
+                    const isEditingThis = editingFriendId === friend.id;
+                    const totalPayerExpenses = expenses
+                      .filter(e => e.payerId === friend.id)
+                      .reduce((sum, e) => sum + e.amount, 0);
+
+                    return (
+                      <div 
+                        key={friend.id} 
+                        className={`p-4 rounded-xl border transition-all ${
+                          isEditingThis ? 'bg-indigo-50/50 border-indigo-300 shadow-sm' : 'bg-slate-50 border-slate-100 hover:border-slate-200'
+                        }`}
+                      >
+                        {isEditingThis ? (
+                          /* Блок редактирования */
+                          <div className="space-y-3">
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              <div>
+                                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Имя участника</label>
+                                <input
+                                  type="text"
+                                  value={editingName}
+                                  onChange={(e) => setEditingName(e.target.value)}
+                                  className="w-full px-3 py-1.5 border border-slate-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-200"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Количество человек</label>
+                                <div className="flex items-center space-x-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingCount(prev => Math.max(1, prev - 1))}
+                                    className="w-8 h-8 bg-white hover:bg-slate-100 border border-slate-200 text-slate-800 font-bold rounded-lg transition-all"
+                                  >
+                                    -
+                                  </button>
+                                  <span className="text-sm font-black text-slate-900 w-8 text-center">{editingCount}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingCount(prev => prev + 1)}
+                                    className="w-8 h-8 bg-white hover:bg-slate-100 border border-slate-200 text-slate-800 font-bold rounded-lg transition-all"
+                                  >
+                                    +
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                            <div className="flex justify-end space-x-2 pt-2">
+                              <button
+                                onClick={() => setEditingFriendId(null)}
+                                className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs font-bold rounded-lg transition-all"
+                              >
+                                Отмена
+                              </button>
+                              <button
+                                onClick={saveEditedFriend}
+                                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg shadow-sm transition-all"
+                              >
+                                Сохранить
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          /* Обычный просмотр карточки */
+                          <div className="flex items-center justify-between gap-4">
+                            <div className="flex items-center space-x-3 min-w-0">
+                              <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm ${getAvatarColor(friend.name)} shrink-0`}>
+                                {friend.name.charAt(0)}
+                              </div>
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="block text-sm font-bold text-slate-800 truncate">{friend.name}</span>
+                                  <span className="text-[10px] bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded-full font-bold">
+                                    {friend.count} чел.
+                                  </span>
+                                </div>
+                                <span className="text-[10px] text-slate-400 block">
+                                  Личные расходы: {totalPayerExpenses.toFixed(1)} ₪
+                                </span>
+                              </div>
+                            </div>
+                            <div className="flex items-center space-x-1 shrink-0">
+                              <button
+                                onClick={() => startEditing(friend)}
+                                className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all"
+                                title="Редактировать"
+                              >
+                                ✏️
+                              </button>
+                              <button
+                                onClick={() => requestRemoveFriend(friend.id, friend.name)}
+                                className="p-1.5 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-all"
+                                title="Исключить"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {}
+      <footer className="bg-white border-t border-slate-100 py-6 mt-12 text-center text-xs text-slate-400">
+        <div className="max-w-5xl mx-auto px-4">
+          <p>© 2026 Калькулятор совместных расходов в шекелях (₪). Ваши данные надежно хранятся локально.</p>
+        </div>
+      </footer>
+    </div>
+  );
+}
